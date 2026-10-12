@@ -1,15 +1,52 @@
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import DeveloperDashboard from "./DeveloperDashboard";
+import PipelineProgress from "./PipelineProgress";
+import ConversationSidebar from "./ConversationSidebar";
+import * as ConversationManager from "./conversationManager";
 
 // ─── Startup Log ─────────────────────────────────────────────────────────────
 console.log(
-  `%c[Placement RAG Agent] App loaded — ${new Date().toISOString()}`,
+  `%c[Agentic Placement RAG] App loaded — ${new Date().toISOString()}`,
   "color:#1E90FF;font-weight:bold"
 );
-if (!import.meta.env.VITE_GEMINI_API_KEY) {
+if (!import.meta.env.VITE_API_BASE_URL && !import.meta.env.VITE_API_URL) {
   console.warn(
-    "[Placement RAG Agent] VITE_GEMINI_API_KEY is not set. " +
-    "AI responses will be unavailable until the variable is configured."
+    "[Agentic Placement RAG] Neither VITE_API_BASE_URL nor VITE_API_URL is set. " +
+    "Using same-origin API path /api/chat by default."
   );
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+function generateUUID() {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+function getApiBase() {
+  // Support both VITE_API_BASE_URL (local) and VITE_API_URL (render.yaml)
+  const raw = (
+    import.meta.env.VITE_API_BASE_URL ||
+    import.meta.env.VITE_API_URL ||
+    ""
+  ).trim().replace(/\/$/, "");
+  if (raw && !/^https?:\/\//i.test(raw)) {
+    return `https://${raw}`;
+  }
+  return raw;
+}
+
+function getSessionId() {
+  let sid = sessionStorage.getItem("rag_session_id");
+  if (!sid) {
+    sid = generateUUID();
+    sessionStorage.setItem("rag_session_id", sid);
+  }
+  return sid;
 }
 
 // ─── Knowledge Bases ────────────────────────────────────────────────────────
@@ -712,120 +749,350 @@ function searchKnowledgeBases(query) {
   return results;
 }
 
-// ─── Gemini API Call ─────────────────────────────────────────────────────────
-async function callGeminiWithRAG(userMessage, ragContext) {
-  const contextText = ragContext
-    .map(
-      (r) =>
-        `[${r.company}]:\n` +
-        r.matches.map((m) => `• ${m.q} (tags: ${m.tags.join(", ")})`).join("\n")
-    )
-    .join("\n\n");
-
-  const systemPrompt = `You are an expert IT Interview Intelligence Agent. You have access to curated interview question databases from top tech companies: Google, Amazon, Microsoft, Meta, Netflix, and Apple.
-
-When a user asks about interview questions for a company or topic, you MUST:
-1. Analyze the retrieved knowledge base context provided to you
-2. Synthesize a comprehensive, well-structured answer
-3. Always cite which company each question or insight comes from using [Company] notation
-4. Group questions by category/theme when possible
-5. Add brief expert tips for each category
-6. Keep responses focused, useful, and actionable
-
-Format your response with clear sections using markdown. Be concise but thorough. Always end with a "Pro Tips" section.`;
-
-  const userContent = ragContext.length > 0
-    ? `User Query: ${userMessage}\n\n--- RETRIEVED CONTEXT FROM KNOWLEDGE BASES ---\n${contextText}\n--- END CONTEXT ---\n\nPlease synthesize the above knowledge base results into a helpful, well-cited answer.`
-    : `User Query: ${userMessage}\n\nNote: No specific matches were found in the knowledge bases for this query. Please provide a helpful general response about IT interview preparation.`;
-
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error("[Placement RAG Agent] VITE_GEMINI_API_KEY is missing at runtime.");
-    return "⚠️ Gemini API key not configured. The site administrator needs to set the VITE_GEMINI_API_KEY environment variable and redeploy.";
-  }
+// ─── Secure Backend API Call ────────────────────────────────────────────────
+async function callGeminiWithRAG(userMessage, sessionId, requestId) {
+  const apiBase = getApiBase();
+  const apiKey = import.meta.env.VITE_API_KEY || "rag-client-key-2026";
 
   let response;
   try {
-    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    response = await fetch(`${apiBase}/api/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": apiKey,
+      },
       body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: systemPrompt }],
-        },
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: userContent }],
-          },
-        ],
-        generationConfig: {
-          maxOutputTokens: 1000,
-        },
+        query: userMessage,
+        session_id: sessionId,
+        request_id: requestId,
       }),
     });
   } catch (networkErr) {
-    console.error("[Placement RAG Agent] Network error calling Gemini API:", networkErr);
-    return "⚠️ Network error — could not reach the Gemini API. Please check your connection and try again.";
+    console.error("[Placement RAG Agent] Network error calling secure API:", networkErr);
+    throw new Error("⚠️ Network error — could not reach the secure RAG API. Please check your connection and try again.");
   }
 
   if (!response.ok) {
-    const errorBody = await response.text();
-    console.error(`[Placement RAG Agent] Gemini API ${response.status}:`, errorBody);
-    throw new Error(`Gemini API error (${response.status}): ${errorBody}`);
+    let detail = "Request could not be processed.";
+    try {
+      const body = await response.json();
+      detail = body?.detail || detail;
+    } catch (_err) {
+      // Keep generic detail to avoid leaking internals.
+    }
+    throw new Error(detail);
   }
 
-  const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.map((part) => part.text).filter(Boolean).join("\n") || "I encountered an issue processing your request.";
+  // Read body as text first to avoid "Unexpected end of JSON input" on empty responses
+  const rawText = await response.text();
+  if (!rawText || !rawText.trim()) {
+    throw new Error("Backend returned an empty response. Please try again.");
+  }
+  let data;
+  try {
+    data = JSON.parse(rawText);
+  } catch (_err) {
+    throw new Error("Backend returned an invalid response. Please try again.");
+  }
+  return data;
 }
 
-// ─── Markdown Renderer ────────────────────────────────────────────────────────
-function renderMarkdown(text) {
-  const lines = text.split("\n");
-  const elements = [];
-  let i = 0;
+// ─── Enhanced Markdown Renderer ──────────────────────────────────────────────
+// ─── Production-Quality GFM Markdown Renderer (Handbook Typography) ──────────
+function MarkdownRenderer({ content }) {
+  if (!content) return null;
 
-  while (i < lines.length) {
-    const line = lines[i];
-    if (line.startsWith("### ")) {
-      elements.push(<h3 key={i} style={{ color: "#1E90FF", fontSize: "0.85rem", fontFamily: "'Orbitron', 'Space Mono', monospace", marginTop: "1rem", marginBottom: "0.3rem", textTransform: "uppercase", letterSpacing: "0.12em", textShadow: "0 0 8px #1E90FF55, 0 0 20px #1E90FF22" }}>{line.slice(4)}</h3>);
-    } else if (line.startsWith("## ")) {
-      elements.push(<h2 key={i} style={{ color: "#1E90FF", fontSize: "0.95rem", fontFamily: "'Orbitron', 'Space Mono', monospace", marginTop: "1.2rem", marginBottom: "0.4rem", borderBottom: "1px solid #1E90FF1A", paddingBottom: "0.3rem", textShadow: "0 0 10px #1E90FF55, 0 0 25px #1E90FF22" }}>{line.slice(3)}</h2>);
-    } else if (line.startsWith("**") && line.endsWith("**")) {
-      elements.push(<p key={i} style={{ color: "#e0e0e0", fontWeight: "bold", margin: "0.5rem 0 0.2rem" }}>{line.slice(2, -2)}</p>);
-    } else if (line.startsWith("• ") || line.startsWith("- ") || line.startsWith("* ")) {
-      const content = line.slice(2);
-      // Handle inline bold and citations
-      const parts = content.split(/(\*\*[^*]+\*\*|\[[^\]]+\])/g);
-      elements.push(
-        <div key={i} style={{ display: "flex", gap: "0.5rem", marginBottom: "0.25rem", paddingLeft: "0.5rem" }}>
-          <span style={{ color: "#1E90FF", flexShrink: 0 }}>▸</span>
-          <span style={{ color: "#c8c8c8", fontSize: "0.88rem", lineHeight: 1.6 }}>
-            {parts.map((p, j) => {
-              if (p.startsWith("**") && p.endsWith("**")) return <strong key={j} style={{ color: "#fff" }}>{p.slice(2, -2)}</strong>;
-              if (p.startsWith("[") && p.endsWith("]")) return <span key={j} style={{ color: "#1E90FF", fontFamily: "'Space Mono', monospace", fontSize: "0.8em", backgroundColor: "#1E90FF22", padding: "0 4px", borderRadius: "3px" }}>{p}</span>;
-              return p;
-            })}
-          </span>
-        </div>
-      );
-    } else if (line.trim() === "") {
-      elements.push(<div key={i} style={{ height: "0.4rem" }} />);
-    } else {
-      const parts = line.split(/(\*\*[^*]+\*\*|\[[^\]]+\])/g);
-      elements.push(
-        <p key={i} style={{ color: "#c8c8c8", fontSize: "0.88rem", lineHeight: 1.7, margin: "0.15rem 0" }}>
-          {parts.map((p, j) => {
-            if (p.startsWith("**") && p.endsWith("**")) return <strong key={j} style={{ color: "#fff" }}>{p.slice(2, -2)}</strong>;
-            if (p.startsWith("[") && p.endsWith("]")) return <span key={j} style={{ color: "#1E90FF", fontFamily: "'Space Mono', monospace", fontSize: "0.85em", backgroundColor: "#1E90FF22", padding: "0 4px", borderRadius: "3px" }}>{p}</span>;
-            return p;
-          })}
-        </p>
-      );
-    }
-    i++;
-  }
-  return elements;
+  return (
+    <div
+      className="markdown-body"
+      style={{
+        fontFamily: "'Times New Roman', Times, serif",
+        color: "#F3F6F9",
+        lineHeight: "1.75",
+        fontSize: "1.08rem",
+        width: "100%",
+        maxWidth: "100%",
+        wordBreak: "break-word",
+      }}
+    >
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ node, ...props }) => (
+            <h1
+              style={{
+                fontFamily: "'Times New Roman', Times, serif",
+                fontSize: "1.85rem",
+                fontWeight: "700",
+                color: "#FFFFFF",
+                marginTop: "2.4rem",
+                marginBottom: "1.1rem",
+                lineHeight: "1.3",
+                borderBottom: "1px solid rgba(30, 144, 255, 0.28)",
+                boxShadow: "0 1px 0 rgba(0, 0, 0, 0.9)",
+                paddingBottom: "0.5rem",
+              }}
+              {...props}
+            />
+          ),
+          h2: ({ node, ...props }) => (
+            <h2
+              style={{
+                fontFamily: "'Times New Roman', Times, serif",
+                fontSize: "1.52rem",
+                fontWeight: "700",
+                color: "#FFFFFF",
+                marginTop: "2.1rem",
+                marginBottom: "0.9rem",
+                lineHeight: "1.35",
+                borderBottom: "1px solid rgba(30, 144, 255, 0.18)",
+                paddingBottom: "0.4rem",
+              }}
+              {...props}
+            />
+          ),
+          h3: ({ node, ...props }) => (
+            <h3
+              style={{
+                fontFamily: "'Times New Roman', Times, serif",
+                fontSize: "1.28rem",
+                fontWeight: "600",
+                color: "#F8FAFC",
+                marginTop: "1.7rem",
+                marginBottom: "0.6rem",
+                lineHeight: "1.4",
+              }}
+              {...props}
+            />
+          ),
+          h4: ({ node, ...props }) => (
+            <h4
+              style={{
+                fontFamily: "'Times New Roman', Times, serif",
+                fontSize: "1.14rem",
+                fontWeight: "600",
+                color: "#F1F5F9",
+                marginTop: "1.4rem",
+                marginBottom: "0.5rem",
+                lineHeight: "1.4",
+              }}
+              {...props}
+            />
+          ),
+          p: ({ node, ...props }) => (
+            <p
+              style={{
+                fontFamily: "'Times New Roman', Times, serif",
+                fontSize: "1.08rem",
+                lineHeight: "1.75",
+                color: "#F3F6F9",
+                marginTop: "0.3rem",
+                marginBottom: "1.3rem",
+              }}
+              {...props}
+            />
+          ),
+          ul: ({ node, ...props }) => (
+            <ul
+              style={{
+                fontFamily: "'Times New Roman', Times, serif",
+                fontSize: "1.08rem",
+                lineHeight: "1.75",
+                color: "#F3F6F9",
+                marginTop: "0.5rem",
+                marginBottom: "1.4rem",
+                paddingLeft: "1.8rem",
+                listStyleType: "disc",
+              }}
+              {...props}
+            />
+          ),
+          ol: ({ node, ...props }) => (
+            <ol
+              style={{
+                fontFamily: "'Times New Roman', Times, serif",
+                fontSize: "1.08rem",
+                lineHeight: "1.75",
+                color: "#F3F6F9",
+                marginTop: "0.5rem",
+                marginBottom: "1.4rem",
+                paddingLeft: "1.8rem",
+                listStyleType: "decimal",
+              }}
+              {...props}
+            />
+          ),
+          li: ({ node, ...props }) => (
+            <li
+              style={{
+                marginBottom: "0.6rem",
+                lineHeight: "1.75",
+                color: "#F3F6F9",
+              }}
+              {...props}
+            />
+          ),
+          hr: ({ node, ...props }) => (
+            <hr
+              style={{
+                border: "none",
+                height: "1px",
+                background: "rgba(255, 255, 255, 0.08)",
+                boxShadow: "0 1px 0 rgba(30, 144, 255, 0.15)",
+                margin: "2.4rem 0",
+              }}
+              {...props}
+            />
+          ),
+          blockquote: ({ node, ...props }) => (
+            <blockquote
+              style={{
+                borderLeft: "4px solid rgba(30, 144, 255, 0.65)",
+                background: "#040404",
+                boxShadow: "inset 3px 3px 7px rgba(0, 0, 0, 0.85), inset -2px -2px 5px rgba(255, 255, 255, 0.02)",
+                borderRadius: "0 10px 10px 0",
+                paddingTop: "0.6rem",
+                paddingBottom: "0.6rem",
+                paddingLeft: "1.2rem",
+                paddingRight: "1rem",
+                paddingY: "0.6rem",
+                margin: "1.4rem 0",
+                color: "#C9CFD6",
+                fontStyle: "italic",
+                lineHeight: "1.75",
+                fontFamily: "'Times New Roman', Times, serif",
+              }}
+              {...props}
+            />
+          ),
+          strong: ({ node, ...props }) => (
+            <strong style={{ fontWeight: "700", color: "#FFFFFF" }} {...props} />
+          ),
+          em: ({ node, ...props }) => (
+            <em style={{ fontStyle: "italic", color: "#E2E8F0" }} {...props} />
+          ),
+          code: ({ node, inline, className, children, ...props }) => {
+            const match = /language-(\w+)/.exec(className || "");
+            return !inline && (match || String(children).includes("\n")) ? (
+              <pre
+                style={{
+                  background: "#040404",
+                  border: "1px solid rgba(0, 0, 0, 0.85)",
+                  boxShadow: "inset 4px 4px 10px rgba(0, 0, 0, 0.9), inset -3px -3px 8px rgba(255, 255, 255, 0.02)",
+                  borderRadius: "12px",
+                  padding: "1.2rem",
+                  margin: "1.5rem 0",
+                  overflowX: "auto",
+                  fontFamily: "'Space Mono', monospace",
+                  fontSize: "0.9rem",
+                  lineHeight: "1.6",
+                  color: "#A7B7CC",
+                }}
+              >
+                <code className={className} style={{ fontFamily: "'Space Mono', monospace" }} {...props}>
+                  {children}
+                </code>
+              </pre>
+            ) : (
+              <code
+                style={{
+                  background: "#101010",
+                  padding: "0.15em 0.45em",
+                  borderRadius: "6px",
+                  fontFamily: "'Space Mono', monospace",
+                  fontSize: "0.88em",
+                  color: "#57B6FF",
+                  border: "1px solid rgba(0, 0, 0, 0.8)",
+                  borderTop: "1px solid rgba(255, 255, 255, 0.07)",
+                  borderLeft: "1px solid rgba(255, 255, 255, 0.07)",
+                  boxShadow: "1px 1px 3px rgba(0, 0, 0, 0.6)",
+                }}
+                {...props}
+              >
+                {children}
+              </code>
+            );
+          },
+          a: ({ node, ...props }) => (
+            <a
+              style={{
+                color: "#1E90FF",
+                textDecoration: "underline",
+                fontWeight: "500",
+              }}
+              target="_blank"
+              rel="noopener noreferrer"
+              {...props}
+            />
+          ),
+          table: ({ node, ...props }) => (
+            <div style={{ overflowX: "auto", margin: "1.8rem 0", width: "100%", maxWidth: "100%" }}>
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: "1rem",
+                  fontFamily: "'Times New Roman', Times, serif",
+                  color: "#F3F6F9",
+                  border: "1px solid rgba(0, 0, 0, 0.8)",
+                  borderRadius: "12px",
+                  background: "#040404",
+                  boxShadow: "inset 4px 4px 10px rgba(0, 0, 0, 0.85), inset -3px -3px 8px rgba(255, 255, 255, 0.02), 3px 3px 8px rgba(0, 0, 0, 0.5)",
+                }}
+                {...props}
+              />
+            </div>
+          ),
+          thead: ({ node, ...props }) => (
+            <thead
+              style={{
+                background: "linear-gradient(180deg, #101010, #0a0a0a)",
+                boxShadow: "inset 0 -2px 0 rgba(30, 144, 255, 0.35)",
+              }}
+              {...props}
+            />
+          ),
+          tbody: ({ node, ...props }) => <tbody {...props} />,
+          tr: ({ node, ...props }) => (
+            <tr
+              style={{
+                borderBottom: "1px solid rgba(0, 0, 0, 0.55)",
+              }}
+              {...props}
+            />
+          ),
+          th: ({ node, ...props }) => (
+            <th
+              style={{
+                padding: "0.85rem 1.1rem",
+                textAlign: "left",
+                fontWeight: "700",
+                color: "#FFFFFF",
+                borderBottom: "2px solid rgba(30, 144, 255, 0.45)",
+                borderRight: "1px solid rgba(0, 0, 0, 0.5)",
+                whiteSpace: "nowrap",
+              }}
+              {...props}
+            />
+          ),
+          td: ({ node, ...props }) => (
+            <td
+              style={{
+                padding: "0.85rem 1.1rem",
+                color: "#F3F6F9",
+                borderRight: "1px solid rgba(0, 0, 0, 0.45)",
+                lineHeight: "1.65",
+              }}
+              {...props}
+            />
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 // ─── Typing Animation ─────────────────────────────────────────────────────────
@@ -850,49 +1117,58 @@ function TypingDots() {
 function CitationCard({ result, index }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="glass-card" style={{
-      border: `1px solid ${result.color}22`,
-      borderLeft: `3px solid ${result.color}88`,
-      borderRadius: "10px",
+    <div style={{
+      border: "1px solid rgba(0, 0, 0, 0.65)",
+      borderTop: "1px solid rgba(255, 255, 255, 0.08)",
+      borderLeft: "3px solid #1E90FF",
+      borderRadius: "12px",
       marginBottom: "0.5rem",
-      background: "rgba(10,18,35,0.6)",
+      background: "#0B0B0B",
+      boxShadow: "var(--shadow-raised)",
       overflow: "hidden",
-      transition: "all 0.3s ease",
-      backdropFilter: "blur(12px)",
-      WebkitBackdropFilter: "blur(12px)",
-      boxShadow: `0 0 15px ${result.color}0A`,
+      transition: "all 0.25s ease",
     }}>
       <div
         onClick={() => setExpanded(!expanded)}
-        style={{ display: "flex", alignItems: "center", gap: "0.6rem", padding: "0.55rem 0.8rem", cursor: "pointer" }}
+        style={{ display: "flex", alignItems: "center", gap: "0.65rem", padding: "0.6rem 0.95rem", cursor: "pointer", userSelect: "none" }}
       >
         <span style={{
-          background: `linear-gradient(135deg, ${result.color}, ${result.color}cc)`,
-          color: "#fff", borderRadius: "5px",
-          padding: "2px 8px", fontSize: "0.7rem", fontFamily: "'Space Mono', monospace", fontWeight: "bold",
-          boxShadow: `0 0 10px ${result.color}44`,
-          textShadow: "0 0 4px rgba(255,255,255,0.5)",
+          background: "#1E90FF",
+          color: "#fff",
+          borderRadius: "8px",
+          padding: "2px 8px",
+          fontSize: "0.68rem",
+          fontFamily: "'Space Mono', monospace",
+          fontWeight: "bold",
+          boxShadow: "0 2px 4px rgba(0, 0, 0, 0.6), inset 1px 1px 1px rgba(255, 255, 255, 0.35), 0 0 10px rgba(30, 144, 255, 0.35)",
+          textShadow: "1px 1px 2px rgba(0,0,0,0.5)",
         }}>
           {result.icon || result.company[0]}
         </span>
-        <span style={{ color: "#C8D8EA", fontSize: "0.82rem", fontFamily: "'Space Mono', monospace", flex: 1 }}>
+        <span style={{ color: "#F5F5F5", fontSize: "0.82rem", fontFamily: "'Space Mono', monospace", flex: 1, fontWeight: "bold" }}>
           {result.company}
         </span>
-        <span style={{ color: "#5A7A9A", fontSize: "0.75rem" }}>{result.matches.length} matches</span>
-        <span style={{ color: result.color, fontSize: "0.8rem", transform: expanded ? "rotate(90deg)" : "none", transition: "0.25s", filter: `drop-shadow(0 0 4px ${result.color}66)` }}>▶</span>
+        <span style={{ color: "#8A8A8A", fontSize: "0.75rem", fontFamily: "'Space Mono', monospace" }}>{result.matches.length} matches</span>
+        <span style={{ color: "#1E90FF", fontSize: "0.8rem", transform: expanded ? "rotate(90deg)" : "none", transition: "0.2s", filter: expanded ? "drop-shadow(0 0 4px rgba(30, 144, 255, 0.5))" : "none" }}>▶</span>
       </div>
       {expanded && (
-        <div style={{ padding: "0 0.8rem 0.6rem", borderTop: `1px solid ${result.color}15` }}>
+        <div style={{ padding: "0.2rem 0.95rem 0.75rem", borderTop: "1px solid rgba(0,0,0,0.7)", boxShadow: "inset 3px 3px 6px rgba(0,0,0,0.85), inset -2px -2px 5px rgba(255,255,255,0.02)", background: "#040404" }}>
           {result.matches.map((m, i) => (
-            <div key={i} style={{ padding: "0.4rem 0", borderBottom: i < result.matches.length - 1 ? "1px solid rgba(255,255,255,0.03)" : "none" }}>
-              <p style={{ color: "#B8C8D8", fontSize: "0.82rem", margin: "0 0 0.2rem", lineHeight: 1.5 }}>{m.q}</p>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem" }}>
+            <div key={i} style={{ padding: "0.5rem 0", borderBottom: i < result.matches.length - 1 ? "1px solid rgba(0,0,0,0.45)" : "none" }}>
+              <p style={{ color: "#F5F5F5", fontSize: "0.82rem", margin: "0 0 0.3rem", lineHeight: 1.5 }}>{m.q}</p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem" }}>
                 {m.tags.map((t) => (
                   <span key={t} style={{
-                    background: `${result.color}15`, color: result.color,
-                    fontSize: "0.68rem", padding: "1px 6px", borderRadius: "4px",
+                    background: "#0B0B0B",
+                    color: "#8A8A8A",
+                    fontSize: "0.65rem",
+                    padding: "1px 6px",
+                    borderRadius: "6px",
                     fontFamily: "'Space Mono', monospace",
-                    border: `1px solid ${result.color}1A`,
+                    border: "1px solid rgba(0,0,0,0.6)",
+                    borderTop: "1px solid rgba(255,255,255,0.06)",
+                    borderLeft: "1px solid rgba(255,255,255,0.06)",
+                    boxShadow: "1px 1px 3px rgba(0,0,0,0.55)",
                   }}>{t}</span>
                 ))}
               </div>
@@ -905,70 +1181,115 @@ function CitationCard({ result, index }) {
 }
 
 // ─── Message ──────────────────────────────────────────────────────────────────
-function Message({ msg }) {
+function Message({ msg, apiBase }) {
   const isUser = msg.role === "user";
   return (
-    <div style={{ marginBottom: "1.5rem", display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.4rem" }}>
+    <div style={{ marginBottom: "1.75rem", display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.55rem", marginBottom: "0.4rem" }}>
         {!isUser && (
           <div style={{
-            width: 28, height: 28, borderRadius: "50%",
-            background: "linear-gradient(135deg, #1E90FF, #0A5EB5)",
+            width: 26, height: 26, borderRadius: "50%",
+            background: "linear-gradient(145deg, #101010, #080808)",
+            border: "1px solid rgba(0, 0, 0, 0.7)",
+            borderTop: "1px solid rgba(255, 255, 255, 0.1)",
+            borderLeft: "1px solid rgba(255, 255, 255, 0.1)",
             display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: "0.6rem", fontWeight: "bold", color: "#fff", fontFamily: "'Space Mono', monospace",
-            boxShadow: "0 0 12px #1E90FF44",
-            textShadow: "0 0 4px rgba(255,255,255,0.5)",
+            fontSize: "0.6rem", fontWeight: "bold", color: "#1E90FF", fontFamily: "'Space Mono', monospace",
+            boxShadow: "var(--shadow-raised-sm), 0 0 8px rgba(30, 144, 255, 0.25)",
           }}>AI</div>
         )}
-        <span style={{ color: "#4A6A8A", fontSize: "0.7rem", fontFamily: "'Space Mono', monospace", letterSpacing: "0.05em" }}>
+        <span style={{ color: "#8A8A8A", fontSize: "0.7rem", fontFamily: "'Space Mono', monospace", letterSpacing: "0.05em" }}>
           {isUser ? "you" : "rag_agent"}
         </span>
         {isUser && (
           <div style={{
-            width: 28, height: 28, borderRadius: "50%",
-            background: "rgba(30,144,255,0.08)",
-            border: "1px solid rgba(30,144,255,0.2)",
+            width: 26, height: 26, borderRadius: "50%",
+            background: "linear-gradient(145deg, #101010, #080808)",
+            border: "1px solid rgba(0, 0, 0, 0.7)",
+            borderTop: "1px solid rgba(255, 255, 255, 0.1)",
+            borderLeft: "1px solid rgba(255, 255, 255, 0.1)",
             display: "flex", alignItems: "center",
-            justifyContent: "center", fontSize: "0.7rem", color: "#6B9FD4",
+            justifyContent: "center", fontSize: "0.7rem", color: "#8A8A8A",
+            boxShadow: "var(--shadow-raised-sm)",
           }}>U</div>
         )}
       </div>
 
       {isUser ? (
-        <div className="glass-card" style={{
-          background: "rgba(14,28,55,0.5)",
-          border: "1px solid rgba(30,144,255,0.15)",
-          borderRadius: "14px 14px 2px 14px",
-          padding: "0.7rem 1rem", maxWidth: "70%", color: "#D0E0F0", fontSize: "0.88rem", lineHeight: 1.6,
-          backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
-          boxShadow: "0 2px 20px rgba(30,144,255,0.06)",
+        <div style={{
+          background: "linear-gradient(145deg, #1565C0, #1976D2)",
+          border: "1px solid rgba(100, 181, 255, 0.45)",
+          borderTop: "1px solid rgba(144, 202, 249, 0.35)",
+          borderLeft: "1px solid rgba(144, 202, 249, 0.35)",
+          boxShadow: "0 4px 18px rgba(30, 144, 255, 0.45), 0 0 0 1px rgba(100, 181, 255, 0.15), inset 0 1px 0 rgba(255,255,255,0.15)",
+          borderRadius: "14px 14px 4px 14px",
+          padding: "0.75rem 1.1rem",
+          maxWidth: "75%",
+          color: "#E3F2FD",
+          fontSize: "0.88rem",
+          lineHeight: 1.6,
         }}>
           {msg.content}
         </div>
       ) : (
         <div style={{ width: "100%", maxWidth: "100%" }}>
           {msg.loading ? (
-            <div className="glass-card" style={{
-              background: "rgba(10,18,35,0.5)", border: "1px solid rgba(30,144,255,0.12)",
-              borderRadius: "2px 14px 14px 14px", padding: "0.7rem 1rem",
-              backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
+            <div style={{
+              background: "linear-gradient(145deg, #0a0a0a, #060606)",
+              border: "1px solid rgba(0, 0, 0, 0.7)",
+              borderBottom: "1px solid rgba(255, 255, 255, 0.04)",
+              borderRight: "1px solid rgba(255, 255, 255, 0.04)",
+              boxShadow: "var(--shadow-inset)",
+              borderRadius: "4px 14px 14px 14px",
+              padding: "0.85rem 1.1rem",
             }}>
-              <TypingDots />
+              {msg.requestId ? (
+                <PipelineProgress
+                  requestId={msg.requestId}
+                  apiBase={apiBase}
+                  onComplete={() => {}}
+                />
+              ) : (
+                <TypingDots />
+              )}
             </div>
           ) : (
             <>
-              <div className="glass-card" style={{
-                background: "rgba(10,18,35,0.5)", border: "1px solid rgba(30,144,255,0.12)",
-                borderRadius: "2px 14px 14px 14px", padding: "0.9rem 1.2rem", marginBottom: "0.75rem",
-                backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
-                boxShadow: "0 4px 30px rgba(30,144,255,0.04)",
+              {/* Rewritten query indicator */}
+              {msg.rewrittenQuery && msg.rewrittenQuery !== msg.originalQuery && (
+                <div style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "0.45rem",
+                  marginBottom: "0.4rem",
+                  padding: "0.3rem 0.6rem",
+                  background: "#040404",
+                  boxShadow: "var(--shadow-inset)",
+                  borderRadius: 8,
+                  border: "1px solid rgba(0, 0, 0, 0.75)",
+                }}>
+                  <span style={{ color: "#8A8A8A", fontSize: "0.62rem", fontFamily: "'Space Mono', monospace" }}>↻ QUERY REWRITTEN:</span>
+                  <span style={{ color: "#1E90FF", fontSize: "0.65rem", fontFamily: "'Space Mono', monospace", fontStyle: "italic", textShadow: "0 0 6px rgba(30, 144, 255, 0.35)" }}>
+                    {msg.rewrittenQuery}
+                  </span>
+                </div>
+              )}
+              <div style={{
+                background: "linear-gradient(145deg, #0c0c0c, #070707)",
+                border: "1px solid rgba(0, 0, 0, 0.65)",
+                borderTop: "1px solid rgba(255, 255, 255, 0.07)",
+                borderLeft: "1px solid rgba(255, 255, 255, 0.07)",
+                boxShadow: "var(--shadow-raised-high)",
+                borderRadius: "4px 16px 16px 16px",
+                padding: "1.4rem 1.8rem",
+                marginBottom: "0.85rem",
               }}>
-                {renderMarkdown(msg.content)}
+                <MarkdownRenderer content={msg.content} />
               </div>
               {msg.citations && msg.citations.length > 0 && (
-                <div>
-                  <p style={{ color: "#3A5A7A", fontSize: "0.7rem", fontFamily: "'Space Mono', monospace", marginBottom: "0.4rem", letterSpacing: "0.1em" }}>
-                    ◈ SOURCES ({msg.citations.length} knowledge bases)
+                <div style={{ marginTop: "0.6rem" }}>
+                  <p style={{ color: "#8A8A8A", fontSize: "0.7rem", fontFamily: "'Space Mono', monospace", marginBottom: "0.45rem", letterSpacing: "0.1em" }}>
+                    ◈ SOURCES ({msg.citations.length} company profiles)
                   </p>
                   {msg.citations.map((c, i) => <CitationCard key={i} result={c} index={i} />)}
                 </div>
@@ -993,20 +1314,26 @@ const SUGGESTIONS = [
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const apiKeyPresent = Boolean(import.meta.env.VITE_GEMINI_API_KEY);
-
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      content: `## Welcome to Interview RAG Agent\n\nI have access to **${COMPANIES.length} curated knowledge bases** from top IT companies:\n\n• **Google** — System design, algorithms, distributed systems\n• **Amazon** — Leadership principles, system design, DSA\n• **Microsoft** — OOP, cloud, real-time systems\n• **Meta** — ML systems, scale, product decisions\n• **Netflix** — Streaming architecture, resilience, data science\n• **Apple** — iOS, privacy, security, hardware-software\n\nAsk me about interview questions for any company or topic, and I'll search across all knowledge bases and provide cited answers.`,
-      citations: [],
-    },
-  ]);
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [activeCompanies] = useState(new Set(COMPANIES));
+
+  // New state: dashboard, session, and request tracking
+  const [dashboardOpen, setDashboardOpen] = useState(false);
+  const [lastRequestId, setLastRequestId] = useState(null);
+  const [sessionId] = useState(() => getSessionId());
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth < 900);
+  const apiBase = getApiBase();
+
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
+
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth < 900);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1017,27 +1344,36 @@ export default function App() {
     if (!query || loading) return;
     setInput("");
 
+    // Generate a unique request_id for this interaction
+    const requestId = generateUUID();
+    setLastRequestId(requestId);
+
     const userMsg = { role: "user", content: query };
-    const loadingMsg = { role: "assistant", content: "", loading: true };
+    const loadingMsg = { role: "assistant", content: "", loading: true, requestId };
     setMessages((prev) => [...prev, userMsg, loadingMsg]);
     setLoading(true);
 
     try {
-      // RAG: search knowledge bases
-      const ragResults = searchKnowledgeBases(query);
-
-      // Call Gemini with RAG context
-      const aiResponse = await callGeminiWithRAG(query, ragResults);
+      // Call backend /chat with session_id and request_id
+      const aiResponse = await callGeminiWithRAG(query, sessionId, requestId);
 
       setMessages((prev) => [
         ...prev.slice(0, -1),
-        { role: "assistant", content: aiResponse, citations: ragResults },
+        {
+          role: "assistant",
+          content: aiResponse?.answer || aiResponse?.text || "I encountered an issue processing your request.",
+          citations: aiResponse?.meta?.citations || aiResponse?.citations || [],
+          requestId,
+          rewrittenQuery: aiResponse?.pipeline_data?.rewritten_query || aiResponse?.rewritten_query || null,
+          originalQuery: query,
+          pipelineData: aiResponse?.pipeline_data || null,
+        },
       ]);
     } catch (err) {
       console.error("[Placement RAG Agent] handleSend error:", err);
       setMessages((prev) => [
         ...prev.slice(0, -1),
-        { role: "assistant", content: `⚠️ Something went wrong: ${err.message || "Unknown error"}. Please try again.`, citations: [] },
+        { role: "assistant", content: `⚠️ Something went wrong: ${err.message || "Unknown error"}. Please try again.`, citations: [], requestId },
       ]);
     }
     setLoading(false);
@@ -1045,292 +1381,268 @@ export default function App() {
 
   return (
     <div style={{
-      minHeight: "100vh",
-      background: "#050A15",
+      height: "100vh",
+      width: "100vw",
+      background: "#050505",
       fontFamily: "'Sora', 'Segoe UI', sans-serif",
       display: "flex",
       flexDirection: "column",
-      position: "relative",
       overflow: "hidden",
+      color: "#F5F5F5",
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@300;400;500;600&family=Orbitron:wght@400;500;600;700;800;900&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #1E90FF33; border-radius: 2px; }
-        ::-webkit-scrollbar-thumb:hover { background: #1E90FF66; }
-        @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes float1 { 0%, 100% { transform: translate(0, 0) scale(1); } 33% { transform: translate(30px, -20px) scale(1.05); } 66% { transform: translate(-20px, 15px) scale(0.95); } }
-        @keyframes float2 { 0%, 100% { transform: translate(0, 0) scale(1); } 50% { transform: translate(-40px, -30px) scale(1.1); } }
-        @keyframes float3 { 0%, 100% { transform: translate(0, 0); } 25% { transform: translate(20px, -40px); } 50% { transform: translate(-15px, -20px); } 75% { transform: translate(25px, 10px); } }
-        @keyframes borderGlow { 0%, 100% { border-color: rgba(30,144,255,0.13); box-shadow: 0 0 15px #1E90FF11; } 50% { border-color: rgba(30,144,255,0.28); box-shadow: 0 0 30px #1E90FF22; } }
-        @keyframes neonPulse { 0%, 100% { text-shadow: 0 0 7px #1E90FF88, 0 0 20px #1E90FF44, 0 0 40px #1E90FF22; } 50% { text-shadow: 0 0 10px #1E90FFbb, 0 0 30px #1E90FF66, 0 0 60px #1E90FF33; } }
-        @keyframes orbGlow { 0%, 100% { box-shadow: 0 0 20px #1E90FF33, inset 0 0 20px #1E90FF11; } 50% { box-shadow: 0 0 40px #1E90FF55, inset 0 0 30px #1E90FF22; } }
-        .msg-enter { animation: fadeIn 0.3s ease forwards; }
-        textarea:focus { outline: none; }
-        textarea { resize: none; }
-        .send-btn { transition: all 0.3s ease !important; }
-        .send-btn:hover { background: linear-gradient(135deg, #1E90FF, #57B6FF) !important; transform: scale(1.05); box-shadow: 0 0 25px #1E90FF66 !important; }
-        .send-btn:active { transform: scale(0.97); }
-        .suggestion-btn { transition: all 0.3s ease !important; }
-        .suggestion-btn:hover { background: rgba(30,144,255,0.12) !important; border-color: #1E90FF66 !important; color: #1E90FF !important; box-shadow: 0 0 20px #1E90FF22 !important; transform: translateY(-1px); }
-        .company-badge { transition: all 0.3s ease !important; }
-        .company-badge:hover { transform: translateY(-2px); filter: brightness(1.3); }
-        .glass-card { backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+        .suggestion-btn {
+          background: linear-gradient(145deg, #0d0d0d, #080808);
+          border: 1px solid rgba(0, 0, 0, 0.6);
+          border-top-color: rgba(255, 255, 255, 0.07);
+          border-left-color: rgba(255, 255, 255, 0.07);
+          color: #8A8A8A;
+          border-radius: 999px;
+          padding: 0.55rem 1.1rem;
+          font-size: 0.75rem;
+          cursor: pointer;
+          font-family: 'Sora', sans-serif;
+          box-shadow: var(--shadow-raised-sm);
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+          outline: none;
+        }
+        .suggestion-btn:hover {
+          color: #57B6FF;
+          border-color: rgba(30, 144, 255, 0.4);
+          box-shadow: var(--shadow-raised-sm), 0 0 10px rgba(30, 144, 255, 0.25);
+        }
+        .suggestion-btn:focus-visible {
+          border-color: #1E90FF;
+          box-shadow: var(--shadow-raised-sm), 0 0 8px rgba(30, 144, 255, 0.45);
+        }
+        .suggestion-btn:active {
+          background: #030303;
+          box-shadow: var(--shadow-pressed);
+          border-color: rgba(0, 0, 0, 0.8);
+          color: #8A8A8A;
+        }
       `}</style>
 
-      {/* Animated background layers */}
-      <div style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none" }}>
-        {/* Base gradient */}
-        <div style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse 120% 80% at 20% -20%, #0D2347 0%, #07101F 40%, #050A15 70%)" }} />
-        {/* Secondary glow */}
-        <div style={{ position: "absolute", inset: 0, background: "radial-gradient(600px 400px at 80% 100%, #0A1E3D 0%, transparent 70%)" }} />
-        {/* Dot pattern overlay */}
-        <div style={{ position: "absolute", inset: 0, opacity: 0.03, backgroundImage: "radial-gradient(#1E90FF 1px, transparent 1px)", backgroundSize: "30px 30px" }} />
-
-        {/* Floating orbs */}
-        <div style={{
-          position: "absolute", top: "8%", left: "5%", width: 120, height: 120, borderRadius: "50%",
-          background: "radial-gradient(circle at 35% 35%, #1E90FF33, #1E90FF11 40%, transparent 70%)",
-          animation: "float1 12s ease-in-out infinite", filter: "blur(1px)",
-          boxShadow: "0 0 40px #1E90FF22, inset 0 0 30px #1E90FF11",
-        }} />
-        <div style={{
-          position: "absolute", top: "60%", right: "8%", width: 80, height: 80, borderRadius: "50%",
-          background: "radial-gradient(circle at 40% 30%, #57B6FF22, #1E90FF0D 50%, transparent 70%)",
-          animation: "float2 15s ease-in-out infinite", filter: "blur(1px)",
-          boxShadow: "0 0 30px #1E90FF1A",
-        }} />
-        <div style={{
-          position: "absolute", top: "30%", right: "15%", width: 50, height: 50, borderRadius: "50%",
-          background: "radial-gradient(circle at 30% 30%, #89CEFF1A, transparent 60%)",
-          animation: "float3 10s ease-in-out infinite",
-          boxShadow: "0 0 20px #1E90FF11",
-        }} />
-        <div style={{
-          position: "absolute", bottom: "15%", left: "12%", width: 60, height: 60, borderRadius: "50%",
-          background: "radial-gradient(circle at 40% 35%, #1E90FF1A, transparent 60%)",
-          animation: "float2 18s ease-in-out infinite reverse",
-          boxShadow: "0 0 25px #1E90FF11",
-        }} />
-        <div style={{
-          position: "absolute", top: "45%", left: "50%", width: 35, height: 35, borderRadius: "50%",
-          background: "radial-gradient(circle at 35% 35%, #57B6FF15, transparent 60%)",
-          animation: "float1 20s ease-in-out infinite reverse",
-        }} />
-      </div>
-
-      {/* Header */}
-      <div className="glass-card" style={{
-        borderBottom: "1px solid rgba(30,144,255,0.12)",
-        padding: "0.9rem 1.5rem",
+      {/* ── Fixed Header across 100% viewport width ── */}
+      <div style={{
+        flexShrink: 0,
+        width: "100%",
+        borderBottom: "1px solid rgba(0, 0, 0, 0.75)",
+        boxShadow: "0 6px 16px rgba(0, 0, 0, 0.6), inset 0 -1px 0 rgba(255, 255, 255, 0.04), inset 0 1px 0 rgba(255, 255, 255, 0.05)",
+        padding: "0.85rem 1.5rem",
         display: "flex",
         alignItems: "center",
-        gap: "1rem",
-        background: "rgba(8,16,32,0.75)",
-        position: "sticky",
-        top: 0,
-        zIndex: 10,
-        backdropFilter: "blur(20px)",
-        WebkitBackdropFilter: "blur(20px)",
+        gap: "1.1rem",
+        background: "linear-gradient(180deg, #0c0c0c, #080808)",
+        zIndex: 20,
       }}>
-        {/* Logo */}
-        <div style={{
-          width: 40, height: 40, borderRadius: "12px",
-          background: "linear-gradient(135deg, #1E90FF, #0A5EB5)",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          boxShadow: "0 0 25px #1E90FF44, 0 0 50px #1E90FF1A",
-          animation: "orbGlow 4s ease-in-out infinite",
-        }}>
-          <span style={{ fontSize: "1.1rem", filter: "drop-shadow(0 0 4px #fff)" }}>⬡</span>
-        </div>
-        <div>
+        <img 
+          src="/favicon.jpeg" 
+          alt="Agentic Placement RAG Logo"
+          style={{
+            width: 40,
+            height: 40,
+            borderRadius: "12px",
+            border: "1px solid rgba(0, 0, 0, 0.65)",
+            borderTop: "1px solid rgba(255, 255, 255, 0.08)",
+            borderLeft: "1px solid rgba(255, 255, 255, 0.08)",
+            boxShadow: "var(--shadow-raised-sm), 0 0 10px rgba(30, 144, 255, 0.25)",
+            objectFit: "cover",
+          }}
+        />
+        <div style={{ flex: 1 }}>
           <h1 style={{
-            fontFamily: "'Orbitron', 'Space Mono', monospace", color: "#1E90FF",
-            fontSize: "0.9rem", fontWeight: "700", letterSpacing: "0.15em",
-            textShadow: "0 0 10px #1E90FF66, 0 0 30px #1E90FF22",
-            animation: "neonPulse 4s ease-in-out infinite",
+            fontFamily: "'Orbitron', 'Space Mono', monospace",
+            color: "#1E90FF",
+            fontSize: "0.9rem",
+            fontWeight: "bold",
+            letterSpacing: "0.15em",
+            textShadow: "0 0 8px rgba(30, 144, 255, 0.45)",
           }}>
-            INTERVIEW RAG AGENT
+            AGENTIC PLACEMENT RAG
           </h1>
-          <p style={{ color: "#4A7DB8", fontSize: "0.65rem", fontFamily: "'Space Mono', monospace", letterSpacing: "0.05em" }}>
-            {COMPANIES.length} knowledge bases • {Object.values(KNOWLEDGE_BASES).reduce((s, kb) => s + kb.questions.length, 0)} questions indexed
+          <p style={{ color: "#8A8A8A", fontSize: "0.65rem", fontFamily: "'Space Mono', monospace", letterSpacing: "0.05em" }}>
+            Agentic Multi-Source Intelligence • 50 Company Knowledge Bases • Retrieval, Reasoning & Reranking
           </p>
         </div>
 
-        {/* Company badges */}
-        <div style={{ display: "flex", gap: "0.4rem", marginLeft: "auto", flexWrap: "wrap", maxWidth: "60%" }}>
-          {COMPANIES.map((c) => (
-            <div key={c} className="company-badge" style={{
-              padding: "2px 8px", borderRadius: "4px", fontSize: "0.65rem",
-              fontFamily: "'Space Mono', monospace", fontWeight: "bold",
-              background: `${KNOWLEDGE_BASES[c].color}15`,
-              border: `1px solid ${KNOWLEDGE_BASES[c].color}33`,
-              color: KNOWLEDGE_BASES[c].color,
-              textShadow: `0 0 8px ${KNOWLEDGE_BASES[c].color}44`,
-              cursor: "default",
-            }}>{c}</div>
-          ))}
-        </div>
+        <button
+          className={dashboardOpen ? "neo-button active" : "neo-button"}
+          onClick={() => setDashboardOpen(!dashboardOpen)}
+          style={{
+            borderRadius: "999px",
+            padding: "7px 16px",
+            fontSize: "0.7rem",
+            fontFamily: "'Space Mono', monospace",
+            fontWeight: "bold",
+            background: dashboardOpen ? "#030303" : "linear-gradient(145deg, #2A6FDB, #1E5BC6)",
+            border: "1px solid rgba(30, 144, 255, 0.4)",
+            borderTop: "1px solid rgba(255, 255, 255, 0.15)",
+            borderLeft: "1px solid rgba(255, 255, 255, 0.15)",
+            color: "#E0F0FF",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: "0.4rem",
+            flexShrink: 0,
+            transition: "all 0.2s ease",
+            boxShadow: dashboardOpen
+              ? "var(--shadow-pressed)"
+              : "var(--shadow-raised-sm), 0 0 12px rgba(30, 144, 255, 0.35)",
+          }}
+          title="Toggle Developer Dashboard"
+        >
+          <span style={{ fontSize: "0.8rem", color: "#E0F0FF" }}>🛠</span>
+          <span>Developer Dashboard</span>
+        </button>
       </div>
 
-      {/* API key missing warning banner */}
-      {!apiKeyPresent && (
-        <div style={{
-          background: "rgba(255,165,0,0.12)",
-          border: "1px solid rgba(255,165,0,0.4)",
-          borderRadius: "8px",
-          padding: "0.7rem 1.2rem",
-          margin: "0.75rem auto 0",
-          maxWidth: "900px",
-          width: "calc(100% - 3rem)",
-          display: "flex",
-          alignItems: "center",
-          gap: "0.6rem",
-          position: "relative",
-          zIndex: 10,
-          backdropFilter: "blur(10px)",
-          WebkitBackdropFilter: "blur(10px)",
-        }}>
-          <span style={{ fontSize: "1.25rem" }}>⚠️</span>
-          <span style={{ color: "#FFA500", fontSize: "0.82rem", fontFamily: "'Space Mono', monospace", lineHeight: 1.5 }}>
-            <strong>API Key Missing</strong> — VITE_GEMINI_API_KEY is not set. AI-powered answers are disabled.
-            Set the environment variable in Render and redeploy, or add it to your local <code>.env</code> file.
-          </span>
-        </div>
-      )}
-
-      {/* Messages */}
+      {/* ── Main Workspace Row (takes all remaining height below Header) ── */}
       <div style={{
         flex: 1,
-        overflowY: "auto",
-        padding: "1.5rem 1.5rem",
-        maxWidth: "900px",
+        display: "flex",
+        flexDirection: "row",
         width: "100%",
-        margin: "0 auto",
+        overflow: "hidden",
         position: "relative",
         zIndex: 1,
       }}>
-        {messages.map((msg, i) => (
-          <div key={i} className="msg-enter">
-            <Message msg={msg} />
-          </div>
-        ))}
-        <div ref={bottomRef} />
-      </div>
-
-      {/* Suggestions */}
-      {messages.length <= 1 && (
+        {/* ── Chat Panel (Left side / Full width when dashboard closed) ── */}
         <div style={{
-          padding: "0 1.5rem 1rem",
-          maxWidth: "900px",
-          width: "100%",
-          margin: "0 auto",
-          position: "relative",
-          zIndex: 1,
-        }}>
-          <p style={{ color: "#3A6A9F", fontSize: "0.7rem", fontFamily: "'Space Mono', monospace", marginBottom: "0.6rem", letterSpacing: "0.1em" }}>
-            ◈ TRY ASKING
-          </p>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
-            {SUGGESTIONS.map((s, i) => (
-              <button
-                key={i}
-                className="suggestion-btn"
-                onClick={() => handleSend(s)}
-                style={{
-                  background: "rgba(30,144,255,0.05)",
-                  border: "1px solid rgba(30,144,255,0.15)",
-                  color: "#6B9FD4",
-                  borderRadius: "8px",
-                  padding: "0.45rem 0.9rem",
-                  fontSize: "0.75rem",
-                  cursor: "pointer",
-                  fontFamily: "'Sora', sans-serif",
-                  backdropFilter: "blur(8px)",
-                  WebkitBackdropFilter: "blur(8px)",
-                }}
-              >{s}</button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Input */}
-      <div style={{
-        borderTop: "1px solid rgba(30,144,255,0.1)",
-        padding: "1rem 1.5rem",
-        background: "rgba(8,16,32,0.6)",
-        backdropFilter: "blur(20px)",
-        WebkitBackdropFilter: "blur(20px)",
-        maxWidth: "900px",
-        width: "100%",
-        margin: "0 auto",
-        position: "relative",
-        zIndex: 1,
-      }}>
-        <div style={{
+          flex: (!dashboardOpen || isMobile) ? "1 1 100%" : "1 1 66%",
+          width: (!dashboardOpen || isMobile) ? "100%" : "66%",
+          height: "100%",
           display: "flex",
-          gap: "0.75rem",
-          alignItems: "flex-end",
-          background: "rgba(10,20,40,0.6)",
-          border: "1px solid rgba(30,144,255,0.15)",
-          borderRadius: "14px",
-          padding: "0.6rem 0.7rem",
-          animation: "borderGlow 4s ease-in-out infinite",
-          backdropFilter: "blur(12px)",
-          WebkitBackdropFilter: "blur(12px)",
+          flexDirection: "column",
+          position: "relative",
+          transition: "flex 0.35s cubic-bezier(0.4, 0, 0.2, 1), width 0.35s cubic-bezier(0.4, 0, 0.2, 1)",
+          overflow: "hidden",
+          background: "#050505",
         }}>
-          <span style={{ color: "#1E90FF", fontFamily: "'Space Mono', monospace", fontSize: "0.8rem", marginBottom: "0.3rem", flexShrink: 0, textShadow: "0 0 8px #1E90FF66" }}>›</span>
-          <textarea
-            ref={inputRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-            placeholder="Ask about interview questions... (e.g. 'What does Google ask about system design?')"
-            rows={1}
-            style={{
-              flex: 1,
-              background: "transparent",
-              border: "none",
-              color: "#D0E0F0",
-              fontSize: "0.88rem",
-              fontFamily: "'Sora', sans-serif",
-              lineHeight: 1.6,
-              maxHeight: "120px",
-              overflowY: "auto",
-            }}
-            onInput={(e) => {
-              e.target.style.height = "auto";
-              e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
-            }}
-          />
-          <button
-            className="send-btn"
-            onClick={() => handleSend()}
-            disabled={!input.trim() || loading}
-            style={{
-              background: input.trim() && !loading ? "linear-gradient(135deg, #1E90FF, #3AA8FF)" : "rgba(30,144,255,0.1)",
-              border: "none",
-              borderRadius: "10px",
-              width: 38, height: 38,
-              display: "flex", alignItems: "center", justifyContent: "center",
-              cursor: input.trim() && !loading ? "pointer" : "not-allowed",
+          {/* 1. Conversation Area (ONLY this area scrolls) */}
+          <div style={{
+            flex: 1,
+            overflowY: "auto",
+            padding: "1.5rem 1.5rem",
+            position: "relative",
+          }}>
+            {messages.map((msg, i) => (
+              <div key={i} className="msg-enter">
+                <Message msg={msg} apiBase={apiBase} />
+              </div>
+            ))}
+            <div ref={bottomRef} />
+          </div>
+
+          {/* 2. Suggestions (only show when no messages) */}
+          {messages.length === 0 && (
+            <div style={{
+              padding: "0 1.5rem 1.25rem",
               flexShrink: 0,
-              transition: "all 0.3s ease",
-              color: input.trim() && !loading ? "#001830" : "#4a5f7f",
-              fontSize: "1rem",
-              boxShadow: input.trim() && !loading ? "0 0 20px #1E90FF44" : "none",
-            }}
-          >
-            {loading ? "⏳" : "⬆"}
-          </button>
+            }}>
+              <p style={{ color: "#8A8A8A", fontSize: "0.7rem", fontFamily: "'Space Mono', monospace", marginBottom: "0.6rem", letterSpacing: "0.1em" }}>
+                ◈ TRY ASKING
+              </p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+                {SUGGESTIONS.map((s, i) => (
+                  <button
+                    key={i}
+                    className="suggestion-btn"
+                    onClick={() => handleSend(s)}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 3. Input Bar (Sticks to bottom of active Chat Panel) */}
+          <div style={{
+            flexShrink: 0,
+            borderTop: "1px solid rgba(0, 0, 0, 0.75)",
+            boxShadow: "inset 0 1px 0 rgba(255, 255, 255, 0.04)",
+            padding: "1rem 1.5rem",
+            background: "#050505",
+          }}>
+            <div style={{
+              display: "flex",
+              gap: "0.75rem",
+              alignItems: "flex-end",
+              background: "#030303",
+              border: "1px solid rgba(0, 0, 0, 0.85)",
+              borderBottom: "1px solid rgba(255, 255, 255, 0.03)",
+              borderRight: "1px solid rgba(255, 255, 255, 0.03)",
+              borderRadius: "18px",
+              padding: "0.65rem 0.8rem",
+              boxShadow: "var(--shadow-inset-deep), 0 0 0 1px rgba(255, 255, 255, 0.02)",
+            }}>
+              <span style={{ color: "#1E90FF", fontFamily: "'Space Mono', monospace", fontSize: "0.85rem", marginBottom: "0.3rem", flexShrink: 0, textShadow: "0 0 6px rgba(30, 144, 255, 0.5)" }}>›</span>
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+                placeholder="Ask about interview questions... (e.g. 'What does Google ask about system design?')"
+                rows={1}
+                style={{
+                  flex: 1,
+                  background: "transparent",
+                  border: "none",
+                  color: "#F5F5F5",
+                  fontSize: "0.88rem",
+                  fontFamily: "'Sora', sans-serif",
+                  lineHeight: 1.6,
+                  maxHeight: "120px",
+                  overflowY: "auto",
+                  outline: "none",
+                }}
+                onInput={(e) => {
+                  e.target.style.height = "auto";
+                  e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
+                }}
+              />
+              <button
+                onClick={() => handleSend()}
+                disabled={!input.trim() || loading}
+                style={{
+                  background: input.trim() && !loading ? "linear-gradient(145deg, #101010, #090909)" : "#020202",
+                  border: "1px solid rgba(0, 0, 0, 0.7)",
+                  borderTop: input.trim() && !loading ? "1px solid rgba(255, 255, 255, 0.09)" : "1px solid rgba(0, 0, 0, 0.7)",
+                  borderLeft: input.trim() && !loading ? "1px solid rgba(255, 255, 255, 0.09)" : "1px solid rgba(0, 0, 0, 0.7)",
+                  borderRadius: "12px",
+                  width: 38, height: 38,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  cursor: input.trim() && !loading ? "pointer" : "not-allowed",
+                  flexShrink: 0,
+                  transition: "all 0.2s ease",
+                  color: input.trim() && !loading ? "#1E90FF" : "#555555",
+                  fontSize: "1rem",
+                  boxShadow: input.trim() && !loading
+                    ? "var(--shadow-raised-sm), 0 0 10px rgba(30, 144, 255, 0.3)"
+                    : "var(--shadow-pressed)",
+                }}
+              >
+                {loading ? "⏳" : "⬆"}
+              </button>
+            </div>
+            <p style={{ textAlign: "center", color: "#666666", fontSize: "0.65rem", fontFamily: "'Space Mono', monospace", marginTop: "0.5rem", letterSpacing: "0.03em" }}>
+              ⚠️ AI may occasionally have a mind of its own. Snigdha's Agentic Placement RAG can make mistakes. Please verify important results.
+            </p>
+          </div>
         </div>
-        <p style={{ textAlign: "center", color: "#2A4A6B", fontSize: "0.65rem", fontFamily: "'Space Mono', monospace", marginTop: "0.5rem", letterSpacing: "0.05em" }}>
-          Shift+Enter for new line • Enter to send
-        </p>
+
+        {/* ── Developer Dashboard Panel (Right side ~34% on desktop, slide-over on mobile) ── */}
+        <DeveloperDashboard
+          isOpen={dashboardOpen}
+          isMobile={isMobile}
+          onClose={() => setDashboardOpen(false)}
+          requestId={lastRequestId}
+          apiBase={apiBase}
+          isChatLoading={loading}
+        />
       </div>
     </div>
   );
